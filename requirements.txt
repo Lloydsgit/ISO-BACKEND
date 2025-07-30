@@ -4,3 +4,4 @@ python-dotenv
 pyiso8583==3.0.0
 tronpy
 web3
+gunicorn
