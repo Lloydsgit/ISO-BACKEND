@@ -44,7 +44,7 @@ def process_transaction(pan, expiry, cvv, amount, wallet, currency, payout_type)
         expiry=expiry,
         cvv=cvv,
         amount_cents=amount_cents,
-        host=os.getenv("ISO_SERVER_HOST", "0.0.0.0"),
+        host=os.getenv("ISO_SERVER_HOST", "127.0.0.1"),
         port=int(os.getenv("ISO_SERVER_PORT", 8583))
     )
 
