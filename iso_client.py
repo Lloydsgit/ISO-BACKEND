@@ -1,68 +1,104 @@
+# client.py — Terminal ISO8583 Request Sender & Crypto Trigger
+
 import socket
-import struct
-import datetime
+import json
 import logging
-from pyiso8583.iso8583 import Iso8583
-from pyiso8583.specs import default_ascii as spec
+import os
+from decimal import Decimal
+from iso8583_crypto import process_crypto_payout
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def send_iso_authorization(host, port, pan, expiry, cvv, amount_cents):
+def send_iso_authorization(pan, expiry, cvv, amount_cents, host, port):
+    """Send ISO 8583 MTI 0100 request to issuer server"""
+    message = {
+        "mti": "0100",
+        "pan": pan,
+        "expiry": expiry,
+        "cvv": cvv,
+        "amount": amount_cents
+    }
+
+    logger.info(f"Connecting to issuer server at {host}:{port}")
+    with socket.create_connection((host, port), timeout=10) as sock:
+        raw = json.dumps(message).encode()
+        sock.sendall(raw)
+
+        response = sock.recv(4096)
+        if not response:
+            raise Exception("No response from ISO server")
+
+        decoded = json.loads(response.decode())
+        logger.info(f"ISO 8583 Response: {decoded}")
+        return decoded
+
+def process_transaction(pan, expiry, cvv, amount, wallet, currency, payout_type):
+    """Full flow: authorize card, then payout if approved"""
+    amount_decimal = Decimal(amount)
+    amount_cents = int(amount_decimal * 100)
+
+    # ISO 8583 request
+    response = send_iso_authorization(
+        pan=pan,
+        expiry=expiry,
+        cvv=cvv,
+        amount_cents=amount_cents,
+        host=os.getenv("ISO_SERVER_HOST", "127.0.0.1"),
+        port=int(os.getenv("ISO_SERVER_PORT", 8583))
+    )
+
+    if not response.get("approved"):
+        logger.warning(f"Authorization failed: field39={response.get('field39')}")
+        return {
+            "status": "declined",
+            "message": f"Card declined (field39={response.get('field39')})"
+        }
+
+    # Crypto payout
     try:
-        iso = Iso8583(spec=spec)
-        now = datetime.datetime.utcnow()
-
-        iso.set_mti("0100")
-        iso.set_bit(2, pan)
-        iso.set_bit(3, "000000")
-        iso.set_bit(4, f"{amount_cents:012}")
-        iso.set_bit(7, now.strftime("%m%d%H%M%S"))
-        iso.set_bit(11, "123456")
-        iso.set_bit(14, expiry)
-        iso.set_bit(18, "5999")
-        iso.set_bit(22, "901")
-        iso.set_bit(25, "00")
-        iso.set_bit(35, f"{pan}D{expiry}{cvv}")
-        iso.set_bit(41, "TERMID01")
-        iso.set_bit(49, "840")
-
-        msg = iso.get_network_message()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((host, port))
-
-        msg_with_len = struct.pack("!H", len(msg)) + msg
-        sock.sendall(msg_with_len)
-
-        raw_len = sock.recv(2)
-        if len(raw_len) < 2:
-            raise Exception("Incomplete 2-byte header received")
-
-        length = struct.unpack("!H", raw_len)[0]
-        response = b''
-        while len(response) < length:
-            chunk = sock.recv(length - len(response))
-            if not chunk:
-                raise Exception("Socket connection broken")
-            response += chunk
-        sock.close()
-
-        iso_response = Iso8583(spec=spec)
-        iso_response.set_network_message(response)
+        tx_hash = process_crypto_payout(
+            wallet=wallet,
+            amount=amount_decimal,
+            currency=currency,
+            network=payout_type
+        )
 
         return {
-            "approved": iso_response.get_bit(39) == "00",
-            "field39": iso_response.get_bit(39),
-            "mti": iso_response.get_mti(),
-            "amount_received": iso_response.get_bit(4),
-            "transaction_time": iso_response.get_bit(12)
+            "status": "approved",
+            "tx_hash": tx_hash,
+            "message": "Card approved and payout sent"
         }
 
     except Exception as e:
-        logging.exception("Error in ISO8583 communication")
+        logger.error(f"Payout failed: {e}")
         return {
-            "approved": False,
-            "error": str(e),
-            "field39": "96"
+            "status": "payout_failed",
+            "message": str(e),
+            "field39": "91"
         }
+
+# Optional: CLI trigger for testing
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run ISO8583 client and trigger payout")
+    parser.add_argument("--pan", required=True, help="Card number")
+    parser.add_argument("--expiry", required=True, help="MMYY")
+    parser.add_argument("--cvv", required=True, help="CVV")
+    parser.add_argument("--amount", required=True, help="Amount in USD")
+    parser.add_argument("--wallet", required=True, help="Crypto wallet address")
+    parser.add_argument("--currency", required=True, help="Currency (e.g., USDT)")
+    parser.add_argument("--payout_type", required=True, help="ERC20 or TRC20")
+
+    args = parser.parse_args()
+    result = process_transaction(
+        pan=args.pan,
+        expiry=args.expiry,
+        cvv=args.cvv,
+        amount=args.amount,
+        wallet=args.wallet,
+        currency=args.currency,
+        payout_type=args.payout_type
+    )
+    print(json.dumps(result, indent=2))
